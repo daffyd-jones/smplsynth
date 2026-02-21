@@ -1,6 +1,7 @@
 mod audio;
 mod midi;
 mod ui;
+mod plugins;
 
 use audio::AudioCommand;
 use rtrb::RingBuffer;

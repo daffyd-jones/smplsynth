@@ -1,11 +1,13 @@
 use crate::audio::{
-    load_sample_from_file, note_name, AudioCommand, ChannelParams, SampleData, VoiceType,
+    load_sample_from_file, note_name, AudioCommand, ChannelParams, SampleData, VoiceType, EffectSlot,
 };
 use crate::midi::MidiHandler;
+use crate::plugins::{PluginManager, PluginInfo, PluginId};
 use eframe::egui;
 use rtrb::Producer;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::collections::HashMap;
 
 // ============================================================================
 // Color Theme
@@ -55,6 +57,12 @@ pub struct SynthApp {
     test_notes_held: [bool; 4],
     /// Receiver for completed sample loads (from background threads)
     sample_load_rx: mpsc::Receiver<(usize, Result<SampleData, String>)>,
+    /// Plugin manager for CLAP plugins
+    plugin_manager: PluginManager,
+    /// Available plugins for selection
+    available_plugins: Vec<PluginInfo>,
+    /// Open plugin GUI windows
+    open_plugin_guis: HashMap<String, bool>,
     /// Sender cloned into background load threads
     sample_load_tx: mpsc::Sender<(usize, Result<SampleData, String>)>,
 }
@@ -62,6 +70,10 @@ pub struct SynthApp {
 impl SynthApp {
     pub fn new(ui_tx: Producer<AudioCommand>, midi_handler: MidiHandler) -> Self {
         let (sample_load_tx, sample_load_rx) = mpsc::channel();
+        
+        // Initialize plugin manager and scan for plugins
+        let mut plugin_manager = PluginManager::new();
+        let available_plugins = plugin_manager.scan_plugins().unwrap_or_default();
 
         Self {
             ui_tx,
@@ -73,6 +85,9 @@ impl SynthApp {
             test_notes_held: [false; 4],
             sample_load_rx,
             sample_load_tx,
+            plugin_manager,
+            available_plugins,
+            open_plugin_guis: HashMap::new(),
         }
     }
 
@@ -192,7 +207,7 @@ impl SynthApp {
     fn render_header(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading(
-                egui::RichText::new("SYNTH/SAMPLER")
+                egui::RichText::new("SMPLSYNTH")
                     .color(colors::ACCENT_CYAN)
                     .size(28.0)
                     .strong(),
@@ -398,7 +413,7 @@ impl SynthApp {
                 let sample_state = &self.sample_states[idx];
 
                 let (changed, load_path) =
-                    render_channel_strip(&mut cols[col], idx, &mut params, sample_state);
+                    render_channel_strip(&mut cols[col], idx, &mut params, sample_state, self);
 
                 if changed {
                     self.channels[idx] = params;
@@ -430,6 +445,7 @@ fn render_channel_strip(
     idx: usize,
     params: &mut ChannelParams,
     sample_state: &ChannelSampleState,
+    app: &SynthApp,
 ) -> (bool, Option<PathBuf>) {
     let mut changed = false;
     let mut load_path: Option<PathBuf> = None;
@@ -473,12 +489,30 @@ fn render_channel_strip(
                 egui::ComboBox::from_id_salt(format!("voice_{}", idx))
                     .selected_text(params.voice.name())
                     .show_ui(ui, |ui| {
+                        // Built-in voice types
                         for voice in VoiceType::ALL {
+                            let voice_name = voice.name();
                             if ui
-                                .selectable_value(&mut params.voice, voice, voice.name())
+                                .selectable_value(&mut params.voice, voice, voice_name)
                                 .changed()
                             {
                                 changed = true;
+                            }
+                        }
+                        
+                        // Separator
+                        ui.separator();
+                        
+                        // Plugin instruments
+                        for plugin in &app.available_plugins {
+                            if plugin.is_instrument {
+                                let plugin_voice = VoiceType::Plugin(plugin.id.clone());
+                                if ui
+                                    .selectable_value(&mut params.voice, plugin_voice, &plugin.name)
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
                             }
                         }
                     });
@@ -488,6 +522,23 @@ fn render_channel_strip(
             if params.voice == VoiceType::Sample {
                 ui.add_space(4.0);
                 load_path = render_sample_controls(ui, idx, sample_state);
+            }
+
+            // Plugin GUI button (only shown when Plugin voice selected)
+            if let VoiceType::Plugin(plugin_id) = &params.voice {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("PLUGIN GUI")
+                            .color(colors::TEXT_SECONDARY)
+                            .size(10.0),
+                    );
+                    
+                    if ui.button("Open GUI").clicked() {
+                        // TODO: Open plugin GUI in child window
+                        println!("Open GUI for plugin: {}", plugin_id);
+                    }
+                });
             }
 
             // Volume
@@ -514,13 +565,120 @@ fn render_channel_strip(
 
             ui.add_space(8.0);
 
-            // ADSR
-            changed |= render_adsr(ui, params);
+            // ADSR (only show for non-plugin voices)
+            if !matches!(params.voice, VoiceType::Plugin(_)) {
+                changed |= render_adsr(ui, params);
+                ui.add_space(8.0);
+            }
 
-            ui.add_space(8.0);
+            // Filter (only show for non-plugin voices)
+            if !matches!(params.voice, VoiceType::Plugin(_)) {
+                changed |= render_filter(ui, params);
+                ui.add_space(8.0);
+            }
 
-            // Filter
-            changed |= render_filter(ui, params);
+            // Effects chain
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("EFFECTS")
+                        .color(colors::TEXT_SECONDARY)
+                        .size(10.0),
+                );
+
+                // Add effect button
+                if ui.button("+").on_hover_text("Add Effect").clicked() {
+                    params.effects.push(EffectSlot::default());
+                    changed = true;
+                }
+            });
+
+            // Render existing effects
+            let effect_names: Vec<&str> = params.effects.iter()
+                .map(|effect| {
+                    if let Some(plugin_id) = &effect.plugin_id {
+                        app.available_plugins.iter()
+                            .find(|p| p.id == *plugin_id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("Unknown Plugin")
+                    } else {
+                        "No Plugin"
+                    }
+                })
+                .collect();
+
+            let mut to_remove = Vec::new();
+            
+            for (i, effect) in params.effects.iter_mut().enumerate() {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    // Plugin selector dropdown
+                    let current_plugin_name = if let Some(plugin_id) = &effect.plugin_id {
+                        app.available_plugins.iter()
+                            .find(|p| p.id == *plugin_id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("Unknown Plugin")
+                    } else {
+                        "No Plugin"
+                    };
+
+                    egui::ComboBox::from_id_salt(format!("effect_plugin_{}_{}", idx, i))
+                        .selected_text(current_plugin_name)
+                        .show_ui(ui, |ui| {
+                            // Option to remove plugin
+                            let no_plugin_selected = effect.plugin_id.is_none();
+                            if ui.selectable_label(no_plugin_selected, "No Plugin").clicked() {
+                                effect.plugin_id = None;
+                                changed = true;
+                            }
+                            
+                            // Add effect plugins
+                            for plugin in &app.available_plugins {
+                                if plugin.is_effect {
+                                    let is_selected = effect.plugin_id.as_ref().map(|id| id == &plugin.id).unwrap_or(false);
+                                    if ui.selectable_label(is_selected, &plugin.name).clicked() {
+                                        effect.plugin_id = Some(plugin.id.clone());
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        });
+
+                    // Enable/disable toggle
+                    let effect_name = if let Some(plugin_id) = &effect.plugin_id {
+                        app.available_plugins.iter()
+                            .find(|p| p.id == *plugin_id)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("Unknown Plugin")
+                    } else {
+                        "No Plugin"
+                    };
+                    
+                    if ui.selectable_label(effect.enabled, effect_name).clicked() {
+                        effect.enabled = !effect.enabled;
+                        changed = true;
+                    }
+
+                    // GUI button for effect plugins
+                    if let Some(plugin_id) = &effect.plugin_id {
+                        if ui.button("GUI").on_hover_text("Open Plugin GUI").clicked() {
+                            // TODO: Open effect plugin GUI in child window
+                            println!("Open GUI for effect plugin: {}", plugin_id);
+                        }
+                    }
+
+                    // Remove button
+                    if ui.button("×").on_hover_text("Remove Effect").clicked() {
+                        to_remove.push(i);
+                        changed = true;
+                    }
+                });
+            }
+
+            // Remove effects in reverse order to maintain indices
+            for &i in to_remove.iter().rev() {
+                params.effects.remove(i);
+            }
 
             ui.add_space(8.0);
 

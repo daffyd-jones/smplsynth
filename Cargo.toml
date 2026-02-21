@@ -14,6 +14,11 @@ rtrb = "0.3"
 symphonia = { version = "0.5", features = ["mp3", "ogg", "wav", "flac", "pcm", "aac"] }
 rfd = "0.14"
 
+# CLAP plugin hosting
+clack-host = { git = "https://github.com/prokopyl/clack", package = "clack-host" }
+clack-extensions = { git = "https://github.com/prokopyl/clack", package = "clack-extensions" }
+
+
 [profile.release]
 opt-level = 3
 lto = true

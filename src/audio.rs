@@ -1,28 +1,31 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::Consumer;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
 // Types
 // ============================================================================
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum VoiceType {
     Sine,
     Sawtooth,
     Square,
     Triangle,
     Sample,
+    Plugin(String), // Store plugin ID
 }
 
 impl VoiceType {
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Self::Sine => "Sine",
-            Self::Sawtooth => "Sawtooth",
-            Self::Square => "Square",
-            Self::Triangle => "Triangle",
-            Self::Sample => "Sample",
+            Self::Sine => "Sine".to_string(),
+            Self::Sawtooth => "Sawtooth".to_string(),
+            Self::Square => "Square".to_string(),
+            Self::Triangle => "Triangle".to_string(),
+            Self::Sample => "Sample".to_string(),
+            Self::Plugin(plugin_id) => format!("Plugin: {}", plugin_id),
         }
     }
 
@@ -46,6 +49,25 @@ pub struct SampleData {
     pub name: String,
 }
 
+use crate::plugins::PluginId;
+
+#[derive(Clone, Debug)]
+pub struct EffectSlot {
+    pub plugin_id: Option<PluginId>,
+    pub enabled: bool,
+    pub parameters: HashMap<String, f64>,
+}
+
+impl Default for EffectSlot {
+    fn default() -> Self {
+        Self {
+            plugin_id: None,
+            enabled: false,
+            parameters: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ChannelParams {
     pub voice: VoiceType,
@@ -57,6 +79,7 @@ pub struct ChannelParams {
     pub filter_freq: f32,
     pub filter_q: f32,
     pub muted: bool,
+    pub effects: Vec<EffectSlot>, // Effects chain
 }
 
 impl Default for ChannelParams {
@@ -71,6 +94,7 @@ impl Default for ChannelParams {
             filter_freq: 2000.0,
             filter_q: 1.0,
             muted: false,
+            effects: Vec::new(), // Initialize empty effects chain
         }
     }
 }
@@ -141,6 +165,7 @@ struct Oscillator {
     phase: f32,
     phase_inc: f32,
     voice: VoiceType,
+    sample_rate: f32,
 }
 
 impl Oscillator {
@@ -149,6 +174,7 @@ impl Oscillator {
             phase: 0.0,
             phase_inc: freq / sample_rate,
             voice,
+            sample_rate,
         }
     }
 
@@ -171,6 +197,10 @@ impl Oscillator {
                 }
             }
             VoiceType::Sample => 0.0, // Handled separately
+            VoiceType::Plugin(_) => {
+                // Simple test tone for plugin voices (440 Hz sine wave)
+                (self.phase * std::f32::consts::TAU * 440.0 / self.sample_rate).sin()
+            },
         };
         self.phase = (self.phase + self.phase_inc) % 1.0;
         sample
@@ -448,7 +478,7 @@ impl Voice {
             note,
             channel,
             velocity: velocity as f32 / 127.0,
-            source: VoiceSource::Oscillator(Oscillator::new(freq, sample_rate, params.voice)),
+            source: VoiceSource::Oscillator(Oscillator::new(freq, sample_rate, params.voice.clone())),
             envelope: Adsr::new(params, sample_rate),
             filter: BiquadFilter::new(params.filter_freq, params.filter_q, sample_rate),
             sample_rate,
@@ -488,7 +518,19 @@ impl Voice {
         let filtered = self.filter.process(source_sample);
         let env = self.envelope.next_sample();
 
-        filtered * env * self.velocity * params.volume
+        let mut sample = filtered * env * self.velocity * params.volume;
+
+        // Apply effects chain
+        for effect in &params.effects {
+            if let Some(plugin_id) = &effect.plugin_id {
+                if effect.enabled {
+                    // TODO: Process effect through plugin
+                    // For now, just pass through
+                }
+            }
+        }
+
+        sample
     }
 
     fn release(&mut self) {
@@ -854,4 +896,3 @@ pub fn note_name(note: u8) -> String {
     let octave = (note / 12) as i32 - 1;
     format!("{}{}", NAMES[(note % 12) as usize], octave)
 }
-
